@@ -10,8 +10,8 @@ class DonorProfile extends Model
         'user_id',
         'first_name',
         'last_name',
-        'middle_initial' => 'nullable|string|max:10',
-        'suffix' => 'nullable|string|max:20',
+        'middle_initial',
+        'suffix',
         'date_of_birth',
         'gender',
         'house_no',
@@ -20,6 +20,6 @@ class DonorProfile extends Model
         'city_municipality',
         'province_region',
         'postal_zip_code',
-        'contact_number'
+        'contact_number',
     ];
 }
