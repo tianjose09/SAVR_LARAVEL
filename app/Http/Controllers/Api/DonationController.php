@@ -16,7 +16,7 @@ class DonationController extends Controller
 {
     // ── Badge Engine ────────────────────────────────────────────────────────
 
-    private function recalculateBadges(int $userId): void
+    public function recalculateBadges(int $userId): void
     {
         $foodCount      = FoodDonation::where('user_id', $userId)->whereIn('status',['scheduled','completed'])->count();
         $financialTotal = FinancialDonation::where('user_id', $userId)->where('status','paid')->sum('amount');
@@ -24,12 +24,12 @@ class DonationController extends Controller
 
         $badges = Badge::all();
         foreach ($badges as $badge) {
-            $current = match($badge->goal_type) {
-                'food_count'      => $foodCount,
-                'financial_total' => $financialTotal,
-                'service_count'   => $serviceCount,
-                default           => 0,
-            };
+            $current = 0;
+            switch($badge->goal_type) {
+                case 'food_count':      $current = $foodCount; break;
+                case 'financial_total': $current = $financialTotal; break;
+                case 'service_count':   $current = $serviceCount; break;
+            }
 
             $status = 'not_started';
             if ($current >= $badge->goal_value) {
@@ -78,7 +78,17 @@ class DonationController extends Controller
         $secretKey = config('services.paymongo.secret_key');
 
         try {
-            $response = Http::withBasicAuth($secretKey, '')
+            // Save pending record first so we can attach its ID to the success callback
+            $donation = FinancialDonation::create([
+                'user_id'                  => $request->user()->id,
+                'amount'                   => $request->amount,
+                'payment_method'           => 'paymongo',
+                'message'                  => $request->message,
+                'status'                   => 'pending',
+            ]);
+
+            $response = Http::withoutVerifying()
+                ->withBasicAuth($secretKey, '')
                 ->post('https://api.paymongo.com/v1/checkout_sessions', [
                     'data' => [
                         'attributes' => [
@@ -90,14 +100,15 @@ class DonationController extends Controller
                                 'description' => $request->message ?? 'Donation to SAVR Food Bank',
                             ]],
                             'payment_method_types' => ['gcash','card','paymaya'],
-                            'success_url' => config('app.url') . '/api/payment/success',
-                            'cancel_url'  => config('app.url') . '/api/payment/cancel',
+                            'success_url' => $request->getSchemeAndHttpHost() . '/api/payment/success?donation_id=' . $donation->id,
+                            'cancel_url'  => $request->getSchemeAndHttpHost() . '/api/payment/cancel',
                             'description' => 'SAVR Food Bank Donation',
                         ]
                     ]
                 ]);
 
             if ($response->failed()) {
+                $donation->delete(); // Rollback if API fails
                 return response()->json([
                     'success' => false,
                     'message' => 'PayMongo error: ' . $response->body()
@@ -108,15 +119,10 @@ class DonationController extends Controller
             $checkoutUrl   = $data['attributes']['checkout_url'];
             $paymentId     = $data['id'];
 
-            // Save pending record
-            $donation = FinancialDonation::create([
-                'user_id'                  => $request->user()->id,
-                'amount'                   => $request->amount,
-                'payment_method'           => 'paymongo',
-                'paymongo_payment_id'      => $paymentId,
-                'paymongo_checkout_url'    => $checkoutUrl,
-                'message'                  => $request->message,
-                'status'                   => 'pending',
+            // Update row with transaction hashes
+            $donation->update([
+                'paymongo_payment_id'   => $paymentId,
+                'paymongo_checkout_url' => $checkoutUrl,
             ]);
 
             return response()->json([
@@ -234,8 +240,14 @@ class DonationController extends Controller
     public function submitFood(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'food_items'    => 'required|string',
-            'food_images.*' => 'nullable|file|image|mimes:jpg,jpeg,png|max:5120',
+            'food_items'     => 'required|string',
+            'food_images.*'  => 'nullable|file|image|mimes:jpg,jpeg,png|max:5120',
+            'schedule_type'  => 'required|in:pickup,delivery',
+            'preferred_date' => 'required|date',
+            'time_slot'      => 'required|string',
+            'pickup_address' => 'nullable|string',
+            'pickup_lat'     => 'nullable|numeric',
+            'pickup_longitude'=> 'nullable|numeric',  // Map explicitly
         ]);
 
         if ($validator->fails()) {
@@ -244,7 +256,7 @@ class DonationController extends Controller
 
         $foodItems = json_decode($request->food_items, true);
         if (!is_array($foodItems)) {
-            return response()->json(['success'=>false,'message'=>'Invalid food items.'], 422);
+            return response()->json(['success'=>false,'message'=>'Invalid food items array payload.'], 422);
         }
 
         $paths = [];
@@ -258,15 +270,23 @@ class DonationController extends Controller
             'user_id'          => $request->user()->id,
             'food_items'       => $foodItems,
             'food_item_images' => $paths,
-            'status'           => 'pending',
+            'schedule_type'    => $request->schedule_type,
+            'preferred_date'   => $request->preferred_date,
+            'time_slot'        => $request->time_slot,
+            'pickup_address'   => $request->pickup_address,
+            'pickup_lat'       => $request->pickup_latitude ?? null,
+            'pickup_lng'       => $request->pickup_longitude ?? null,
+            'status'           => 'scheduled', // Skip the pending phase since schedule was sent in one shot
         ]);
 
-        $this->logActivity($request->user()->id, 'food', 'Food Donation Submitted',
-            count($foodItems) . ' food item(s) submitted', 'truckicon');
+        $this->logActivity($request->user()->id, 'food', 'Food Donation Incoming',
+            count($foodItems) . ' items scheduled for ' . $request->schedule_type, 'truckicon');
+
+        $this->recalculateBadges($request->user()->id);
 
         return response()->json([
             'success'     => true,
-            'message'     => 'Food donation submitted.',
+            'message'     => 'Food donation and schedule confirmed.',
             'donation_id' => $donation->id,
         ], 201);
     }
@@ -391,6 +411,30 @@ class DonationController extends Controller
         ]);
     }
 
+    public function getUpcomingPickups(Request $request)
+    {
+        $uid = $request->user()->id;
+        
+        $pickups = FoodDonation::where('user_id', $uid)
+            ->whereIn('status', ['pending', 'scheduled'])
+            ->orderBy('created_at', 'desc')
+            ->take(5)
+            ->get()
+            ->map(fn($p) => [
+                'id'             => $p->id,
+                'status'         => $p->status,
+                'preferred_date' => $p->preferred_date,
+                'time_slot'      => $p->time_slot,
+                'pickup_address' => $p->pickup_address,
+                'created_at'     => $p->created_at->format('m/d/Y'),
+            ]);
+
+        return response()->json([
+            'success'  => true,
+            'pickups'  => $pickups
+        ]);
+    }
+
     // ── Badges ────────────────────────────────────────────────────────────────
 
     public function getBadges(Request $request)
@@ -408,9 +452,9 @@ class DonationController extends Controller
                 'icon'        => $badge->icon,
                 'goal_value'  => $badge->goal_value,
                 'goal_type'   => $badge->goal_type,
-                'status'      => $userBadge?->status ?? 'not_started',
-                'progress'    => $userBadge?->progress ?? 0,
-                'earned_at'   => $userBadge?->earned_at,
+                'status'      => $userBadge ? $userBadge->status : 'not_started',
+                'progress'    => $userBadge ? $userBadge->progress : 0,
+                'earned_at'   => $userBadge ? $userBadge->earned_at : null,
             ];
         });
 
