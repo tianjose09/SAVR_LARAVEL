@@ -730,6 +730,8 @@ public function dashboard(Request $request)
     $totalFinancial = \App\Models\FinancialDonation::where('user_id', $user->id)
         ->where('status', 'paid')
         ->sum('amount');
+    $totalFood = \App\Models\FoodDonation::where('user_id', $user->id)->count();
+
     // ✅ Use activity_logs table (written by DonationController on each submission)
     $recentActivities = \App\Models\ActivityLog::where('user_id', $user->id)
         ->orderBy('created_at', 'desc')
@@ -750,6 +752,7 @@ public function dashboard(Request $request)
         'display_name'      => $displayName,
         'role'              => $user->role,
         'total_donations'   => (float) $totalFinancial,
+        'total_food'        => $totalFood,
         'recent_activities' => $recentActivities,
     ], 200);
 }
